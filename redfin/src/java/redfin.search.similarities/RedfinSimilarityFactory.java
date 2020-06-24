@@ -16,7 +16,6 @@
  */
 package redfin.search.similarities;
 
-import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.search.similarities.Similarity;
 import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.schema.SimilarityFactory;
@@ -54,8 +53,7 @@ public class RedfinSimilarityFactory extends SimilarityFactory {
 
   @Override
   public Similarity getSimilarity() {
-    BM25Similarity sim = new BM25Similarity(k1, b);
-    sim.setDiscountOverlaps(discountOverlaps);
+    RedfinSimilarity sim = new RedfinSimilarity();
     return sim;
   }
 }
