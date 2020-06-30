@@ -23,47 +23,93 @@ import java.util.List;
 
 import org.apache.lucene.index.FieldInvertState;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.search.CollectionStatistics;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.SmallFloat;
 
 public class RedfinSimilarity extends Similarity {
 
   public RedfinSimilarity() {
   }
 
+  /**
+   * True if overlap tokens (tokens with a position of increment of zero) are
+   * discounted from the document's length.
+   */
+  protected boolean discountOverlaps = true;
+
+  /** Sets whether overlap tokens (Tokens with 0 position increment) are
+   *  ignored when computing norm.  By default this is false, meaning overlap
+   *  tokens do count when computing norms. */
+  public void setDiscountOverlaps(boolean v) {
+    discountOverlaps = v;
+  }
+
+  /**
+   * Returns true if overlap tokens are discounted from the document's length.
+   * @see #setDiscountOverlaps
+   */
+  public boolean getDiscountOverlaps() {
+    return discountOverlaps;
+  }
+
+  /** Cache of decoded bytes. */
+  private static final float[] LENGTH_TABLE = new float[256];
+
+  static {
+    for (int i = 0; i < 256; i++) {
+      LENGTH_TABLE[i] = SmallFloat.byte4ToInt((byte) i);
+    }
+  }
+
   @Override
   public final long computeNorm(FieldInvertState state) {
-    return 1L;
+    final int numTerms = discountOverlaps ? state.getLength() - state.getNumOverlap() : state.getLength();
+    return SmallFloat.intToByte4(numTerms);
   }
 
   @Override
   public final SimWeight computeWeight(float boost, CollectionStatistics collectionStats, TermStatistics... termStats) {
-    return new RedfinWeights(boost);
+    return new RedfinWeights(collectionStats.field(), boost);
   }
 
   @Override
   public final SimScorer simScorer(SimWeight weights, LeafReaderContext context) throws IOException {
     RedfinWeights redfinWeights = (RedfinWeights) weights;
-    return new RedfinDocScorer(redfinWeights);
+    return new RedfinDocScorer(redfinWeights, context.reader().getNormValues(redfinWeights.field));
   }
 
   private class RedfinDocScorer extends SimScorer {
     private final RedfinWeights weights;
+    private final NumericDocValues norms;
     private final float weightTotalValue; // for now just the boost itself
 
-    RedfinDocScorer(RedfinWeights weights) throws IOException {
+    RedfinDocScorer(RedfinWeights weights, NumericDocValues norms) throws IOException {
       this.weights = weights;
       this.weightTotalValue = weights.boost;
+      this.norms = norms; // field length
     }
 
     @Override
     public float score(int doc, float freq) throws IOException {
-      // we rate with full score if match, and zero if no match.
-      // this way the weight alone fully controls the value
-      return weightTotalValue * (freq > 0 ? 1 : 0);
+      // if there are no norms, use freq itself instead
+      // so freq / norm will yield 1, giving full score to the document
+      float norm;
+      if (norms == null) {
+        norm = freq;
+      } else {
+        if (norms.advanceExact(doc)) {
+          // use the predecoded table
+          norm = LENGTH_TABLE[((byte) norms.longValue()) & 0xFF];
+        } else {
+          norm = freq;
+        }
+      }
+      return weightTotalValue * freq / norm;
     }
 
     @Override
@@ -78,7 +124,7 @@ public class RedfinSimilarity extends Similarity {
 
     @Override
     public Explanation explain(int doc, Explanation freqExpl) throws IOException {
-      return explainScore(doc, freqExpl, weights);
+      return explainScore(doc, freqExpl, weights, norms);
     }
 }
 
@@ -86,19 +132,45 @@ public class RedfinSimilarity extends Similarity {
   private static class RedfinWeights extends SimWeight {
     /** query boost */
     private final float boost;
+    /** field name, for pulling norms */
+    private final String field;
 
-    RedfinWeights(float boost) {
+    RedfinWeights(String field, float boost) {
+      this.field = field;
       this.boost = boost;
     }
   }
 
-  private Explanation explainScore(int doc, Explanation freqExpl, RedfinWeights weights) throws IOException {
+  private Explanation explainTFNorm(
+      int doc,
+      Explanation freqExpl,
+      RedfinWeights weights,
+      NumericDocValues norms,
+      float[] lengthCache) throws IOException {
+    if (norms == null) {
+      return Explanation.match(1, "tfNorm, computed as 1 in absence of norms");
+    }
+
+    float doclen;
+    if (norms.advanceExact(doc)) {
+      doclen = lengthCache[(byte) norms.longValue()];
+    } else {
+      doclen = freqExpl.getValue();
+    }
+    return Explanation.match(
+        (freqExpl.getValue() / doclen),
+        "tfNorm, computed as (freq / fieldLength) with freq=" + freqExpl.getValue() + ", fieldLength=" + doclen);
+  }
+
+  private Explanation explainScore(int doc, Explanation freqExpl, RedfinWeights weights, NumericDocValues norms) throws IOException {
     Explanation boostExpl = Explanation.match(weights.boost, "boost");
     List<Explanation> subs = new ArrayList<>();
     if (boostExpl.getValue() != 1.0f)
       subs.add(boostExpl);
+    Explanation tfNormExpl = explainTFNorm(doc, freqExpl, weights, norms, LENGTH_TABLE);
+    subs.add(tfNormExpl);
     return Explanation.match(
-        boostExpl.getValue(),
+        boostExpl.getValue() * tfNormExpl.getValue(),
         "score(doc="+doc+",freq="+freqExpl+"), product of:", subs);
   }
 

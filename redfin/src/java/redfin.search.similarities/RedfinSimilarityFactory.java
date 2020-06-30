@@ -40,20 +40,17 @@ import org.apache.solr.schema.SimilarityFactory;
  */
 public class RedfinSimilarityFactory extends SimilarityFactory {
   private boolean discountOverlaps;
-  private float k1;
-  private float b;
 
   @Override
   public void init(SolrParams params) {
     super.init(params);
-    discountOverlaps = params.getBool("discountOverlaps", true);
-    k1 = params.getFloat("k1", 1.2f);
-    b = params.getFloat("b", 0.75f);
+    discountOverlaps = params.getBool("discountOverlaps", false);
   }
 
   @Override
   public Similarity getSimilarity() {
     RedfinSimilarity sim = new RedfinSimilarity();
+    sim.setDiscountOverlaps(discountOverlaps);
     return sim;
   }
 }
