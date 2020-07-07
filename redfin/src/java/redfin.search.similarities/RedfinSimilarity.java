@@ -31,9 +31,32 @@ import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.SmallFloat;
 
+/**
+ * Redfin Similarity specially designed for autocomplete
+ * for region and addresses.
+ *
+ * This similarity doesn't impose IDF influence and implements
+ * a much simplified version of TFNorm. The TFNorm assigns a
+ * flat score as long as match is present, regardless of
+ * term frequency, but applies penalty proportional to document length.
+ *
+ * See
+ * https://docs.google.com/document/d/1jHGIjMBDS7rdqXLTCMAjejdzIIEitwZ6eYf1P_sfQ7c
+ * @author Search Team
+ * @author Seekers Team
+ * @author Jason Zhou
+ */
 public class RedfinSimilarity extends Similarity {
+  // between 0 and 1
+  // 0 = no penalty
+  // 1 = maximum penalty for 1 doc length (near 0 score)
+  private final float shortDocPenalty;
 
-  public RedfinSimilarity() {
+  public RedfinSimilarity(float shortDocPenalty) {
+    if (Float.isNaN(shortDocPenalty) || shortDocPenalty < 0 || shortDocPenalty > 1) {
+      throw new IllegalArgumentException("illegal b value: " + shortDocPenalty + ", must be between 0 and 1");
+    }
+    this.shortDocPenalty = shortDocPenalty;
   }
 
   /**
@@ -58,9 +81,16 @@ public class RedfinSimilarity extends Similarity {
   }
 
   /** Cache of decoded bytes. */
+  private static final float[] OLD_LENGTH_TABLE = new float[256];
   private static final float[] LENGTH_TABLE = new float[256];
 
   static {
+    for (int i = 1; i < 256; i++) {
+      float f = SmallFloat.byte315ToFloat((byte)i);
+      OLD_LENGTH_TABLE[i] = 1.0f / (f*f);
+    }
+    OLD_LENGTH_TABLE[0] = 1.0f / OLD_LENGTH_TABLE[255]; // otherwise inf
+
     for (int i = 0; i < 256; i++) {
       LENGTH_TABLE[i] = SmallFloat.byte4ToInt((byte) i);
     }
@@ -74,42 +104,56 @@ public class RedfinSimilarity extends Similarity {
 
   @Override
   public final SimWeight computeWeight(float boost, CollectionStatistics collectionStats, TermStatistics... termStats) {
-    return new RedfinWeights(collectionStats.field(), boost);
+    float[] oldNormCache = new float[256];
+    float[] normCache = new float[256];
+    for (int i = 0; i < normCache.length; i++) {
+      oldNormCache[i] = (1.0f - shortDocPenalty / OLD_LENGTH_TABLE[i]) / OLD_LENGTH_TABLE[i];
+      normCache[i] = (1.0f - shortDocPenalty / LENGTH_TABLE[i]) / LENGTH_TABLE[i];
+    }
+    return new RedfinWeights(collectionStats.field(), boost, oldNormCache, normCache);
   }
 
   @Override
   public final SimScorer simScorer(SimWeight weights, LeafReaderContext context) throws IOException {
     RedfinWeights redfinWeights = (RedfinWeights) weights;
-    return new RedfinDocScorer(redfinWeights, context.reader().getNormValues(redfinWeights.field));
+    return new RedfinDocScorer(redfinWeights, context.reader().getMetaData().getCreatedVersionMajor(), context.reader().getNormValues(redfinWeights.field));
   }
 
   private class RedfinDocScorer extends SimScorer {
     private final RedfinWeights weights;
     private final NumericDocValues norms;
     private final float weightTotalValue; // for now just the boost itself
+    /** precomputed cache for all length values */
+    private final float[] lengthCache;
+    /** precomputed norm[256] with (1.0f - shortDocPenalty / docLen) / docLen; */
+    private final float[] normCache;
 
-    RedfinDocScorer(RedfinWeights weights, NumericDocValues norms) throws IOException {
+    RedfinDocScorer(RedfinWeights weights, int indexCreatedVersionMajor, NumericDocValues norms) throws IOException {
       this.weights = weights;
       this.weightTotalValue = weights.boost;
       this.norms = norms; // field length
+      if (indexCreatedVersionMajor >= 7) {
+        lengthCache = LENGTH_TABLE;
+        this.normCache = weights.normCache;
+      } else {
+        lengthCache = OLD_LENGTH_TABLE;
+        this.normCache = weights.oldNormCache;
+      }
     }
 
     @Override
     public float score(int doc, float freq) throws IOException {
-      // if there are no norms, use freq itself instead
-      // so freq / norm will yield 1, giving full score to the document
-      float norm;
-      if (norms == null) {
-        norm = freq;
-      } else {
-        if (norms.advanceExact(doc)) {
-          // use the predecoded table
-          norm = LENGTH_TABLE[((byte) norms.longValue()) & 0xFF];
-        } else {
-          norm = freq;
-        }
+      // For Redfin's specific use case, higher term frequency should not
+      // contribute to more relevance. Use discrete value 0 or 1.
+      float match = freq > 0 ? 1 : 0;
+      // If there is no usable norm, use 1 instead to yield full score
+      if (norms != null && norms.advanceExact(doc)) {
+        // Use the predecoded table
+        float norm = normCache[((byte) norms.longValue()) & 0xFF];
+        return weightTotalValue * match * norm;
       }
-      return weightTotalValue * freq / norm;
+      // When norm is not available, give full score
+      return weightTotalValue * match;
     }
 
     @Override
@@ -124,7 +168,7 @@ public class RedfinSimilarity extends Similarity {
 
     @Override
     public Explanation explain(int doc, Explanation freqExpl) throws IOException {
-      return explainScore(doc, freqExpl, weights, norms);
+      return explainScore(doc, freqExpl, weights, norms, lengthCache);
     }
 }
 
@@ -134,40 +178,39 @@ public class RedfinSimilarity extends Similarity {
     private final float boost;
     /** field name, for pulling norms */
     private final String field;
+    /** precomputed norm[256] with (1.0f - shortDocPenalty / docLen) / docLen; */
+    private final float[] oldNormCache;
+    private final float[] normCache;
 
-    RedfinWeights(String field, float boost) {
+    RedfinWeights(String field, float boost, float[] oldNormCache, float[] normCache) {
       this.field = field;
       this.boost = boost;
+      this.oldNormCache = oldNormCache;
+      this.normCache = normCache;
     }
   }
 
   private Explanation explainTFNorm(
       int doc,
       Explanation freqExpl,
-      RedfinWeights weights,
       NumericDocValues norms,
       float[] lengthCache) throws IOException {
-    if (norms == null) {
-      return Explanation.match(1, "tfNorm, computed as 1 in absence of norms");
+    float isMatch = freqExpl.getValue() > 0 ? 1 : 0;
+    if (norms != null && norms.advanceExact(doc)) {
+      float doclen = lengthCache[(byte) norms.longValue() & 0xFF];
+      return Explanation.match(
+          isMatch * (1 - shortDocPenalty/ doclen) / doclen,
+          "tfNorm, computed as (isMatch * (1 - shortDocPenalty / fieldLength) / fieldLength) with isMatch=" + isMatch + ", fieldLength=" + doclen + ", shortDocPenalty=" + shortDocPenalty);
     }
-
-    float doclen;
-    if (norms.advanceExact(doc)) {
-      doclen = lengthCache[(byte) norms.longValue()];
-    } else {
-      doclen = freqExpl.getValue();
-    }
-    return Explanation.match(
-        (freqExpl.getValue() / doclen),
-        "tfNorm, computed as (freq / fieldLength) with freq=" + freqExpl.getValue() + ", fieldLength=" + doclen);
+    return Explanation.match(isMatch, "tfNorm, computed as isMatch * 1 in absence of usable norms");
   }
 
-  private Explanation explainScore(int doc, Explanation freqExpl, RedfinWeights weights, NumericDocValues norms) throws IOException {
+  private Explanation explainScore(int doc, Explanation freqExpl, RedfinWeights weights, NumericDocValues norms, float[] lengthCache) throws IOException {
     Explanation boostExpl = Explanation.match(weights.boost, "boost");
     List<Explanation> subs = new ArrayList<>();
     if (boostExpl.getValue() != 1.0f)
       subs.add(boostExpl);
-    Explanation tfNormExpl = explainTFNorm(doc, freqExpl, weights, norms, LENGTH_TABLE);
+    Explanation tfNormExpl = explainTFNorm(doc, freqExpl, norms, lengthCache);
     subs.add(tfNormExpl);
     return Explanation.match(
         boostExpl.getValue() * tfNormExpl.getValue(),

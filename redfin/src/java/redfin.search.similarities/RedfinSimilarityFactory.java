@@ -21,35 +21,38 @@ import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.schema.SimilarityFactory;
 
 /**
- * Factory for {@link BM25Similarity}
+ * Factory for {@link RedfinSimilarity}
  * <p>
  * Parameters:
  * <ul>
- *   <li>k1 (float): Controls non-linear term frequency normalization (saturation).
- *                   The default is <code>1.2</code>
- *   <li>b (float): Controls to what degree document length normalizes tf values.
- *                  The default is <code>0.75</code>
+ *   <li>shortDocPenalty(float): Controls to what degree document length normalizes tf values.
+ *                  Valid value between 0 and 1.
+ *                  0 = no penalty.
+ *                  1 = maximum penalty for 1 doc length (near 0 score).
+ *                  The default is <code>0.5</code>
  * </ul>
  * <p>
  * Optional settings:
  * <ul>
  *   <li>discountOverlaps (bool): Sets
- *       {@link BM25Similarity#setDiscountOverlaps(boolean)}</li>
+ *       {@link RedfinSimilarity#setDiscountOverlaps(boolean)}</li>
  * </ul>
  * @lucene.experimental
  */
 public class RedfinSimilarityFactory extends SimilarityFactory {
   private boolean discountOverlaps;
+  private float shortDocPenalty;
 
   @Override
   public void init(SolrParams params) {
     super.init(params);
     discountOverlaps = params.getBool("discountOverlaps", false);
+    shortDocPenalty = params.getFloat("shortDocPenalty", 0.5f);
   }
 
   @Override
   public Similarity getSimilarity() {
-    RedfinSimilarity sim = new RedfinSimilarity();
+    RedfinSimilarity sim = new RedfinSimilarity(shortDocPenalty);
     sim.setDiscountOverlaps(discountOverlaps);
     return sim;
   }
