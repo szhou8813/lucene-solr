@@ -81,16 +81,9 @@ public class RedfinSimilarity extends Similarity {
   }
 
   /** Cache of decoded bytes. */
-  private static final float[] OLD_LENGTH_TABLE = new float[256];
   private static final float[] LENGTH_TABLE = new float[256];
 
   static {
-    for (int i = 1; i < 256; i++) {
-      float f = SmallFloat.byte315ToFloat((byte)i);
-      OLD_LENGTH_TABLE[i] = 1.0f / (f*f);
-    }
-    OLD_LENGTH_TABLE[0] = 1.0f / OLD_LENGTH_TABLE[255]; // otherwise inf
-
     for (int i = 0; i < 256; i++) {
       LENGTH_TABLE[i] = SmallFloat.byte4ToInt((byte) i);
     }
@@ -104,19 +97,17 @@ public class RedfinSimilarity extends Similarity {
 
   @Override
   public final SimWeight computeWeight(float boost, CollectionStatistics collectionStats, TermStatistics... termStats) {
-    float[] oldNormCache = new float[256];
     float[] normCache = new float[256];
     for (int i = 0; i < normCache.length; i++) {
-      oldNormCache[i] = (1.0f - shortDocPenalty / OLD_LENGTH_TABLE[i]) / OLD_LENGTH_TABLE[i];
       normCache[i] = (1.0f - shortDocPenalty / LENGTH_TABLE[i]) / LENGTH_TABLE[i];
     }
-    return new RedfinWeights(collectionStats.field(), boost, oldNormCache, normCache);
+    return new RedfinWeights(collectionStats.field(), boost, normCache);
   }
 
   @Override
   public final SimScorer simScorer(SimWeight weights, LeafReaderContext context) throws IOException {
     RedfinWeights redfinWeights = (RedfinWeights) weights;
-    return new RedfinDocScorer(redfinWeights, context.reader().getMetaData().getCreatedVersionMajor(), context.reader().getNormValues(redfinWeights.field));
+    return new RedfinDocScorer(redfinWeights, context.reader().getNormValues(redfinWeights.field));
   }
 
   private class RedfinDocScorer extends SimScorer {
@@ -128,17 +119,12 @@ public class RedfinSimilarity extends Similarity {
     /** precomputed norm[256] with (1.0f - shortDocPenalty / docLen) / docLen; */
     private final float[] normCache;
 
-    RedfinDocScorer(RedfinWeights weights, int indexCreatedVersionMajor, NumericDocValues norms) throws IOException {
+    RedfinDocScorer(RedfinWeights weights, NumericDocValues norms) throws IOException {
       this.weights = weights;
       this.weightTotalValue = weights.boost;
       this.norms = norms; // field length
-      if (indexCreatedVersionMajor >= 7) {
-        lengthCache = LENGTH_TABLE;
-        this.normCache = weights.normCache;
-      } else {
-        lengthCache = OLD_LENGTH_TABLE;
-        this.normCache = weights.oldNormCache;
-      }
+      lengthCache = LENGTH_TABLE;
+      this.normCache = weights.normCache;
     }
 
     @Override
@@ -179,13 +165,11 @@ public class RedfinSimilarity extends Similarity {
     /** field name, for pulling norms */
     private final String field;
     /** precomputed norm[256] with (1.0f - shortDocPenalty / docLen) / docLen; */
-    private final float[] oldNormCache;
     private final float[] normCache;
 
-    RedfinWeights(String field, float boost, float[] oldNormCache, float[] normCache) {
+    RedfinWeights(String field, float boost, float[] normCache) {
       this.field = field;
       this.boost = boost;
-      this.oldNormCache = oldNormCache;
       this.normCache = normCache;
     }
   }
